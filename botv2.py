@@ -1,8 +1,3 @@
-"""
-Slurm Notifier Bot — Neon (Postgres) edition
-Run: BOT_TOKEN=xxx NOTIFY_SECRET=xxx DATABASE_URL=postgresql://... python slurm_bot.py
-"""
-
 import logging
 import os
 import re
@@ -10,8 +5,9 @@ import secrets
 import subprocess
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -19,7 +15,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
@@ -36,11 +32,10 @@ log = logging.getLogger("slurm_bot")
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    notify_secret: str    # protects the /notify endpoint
-    database_url: str     # Neon / Postgres connection string
-    log_dir: str = "."   # where slurm-<id>.out files live
+    database_url: str
+    log_dir: str = "."
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = int(os.environ.get("PORT", 8000))  # Railway injects PORT
 
 
 def load_config() -> Config:
@@ -50,9 +45,7 @@ def load_config() -> Config:
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL env var is required")
-    secret = os.environ.get("NOTIFY_SECRET", secrets.token_hex(16))
-    log.info("NOTIFY_SECRET (save this): %s", secret)
-    return Config(bot_token=token, notify_secret=secret, database_url=database_url)
+    return Config(bot_token=token, database_url=database_url)
 
 
 CFG = load_config()
@@ -90,7 +83,6 @@ def init_db() -> None:
 
 @contextmanager
 def db():
-    """Yield a psycopg2 RealDictCursor inside a transaction; always closes cleanly."""
     conn = psycopg2.connect(CFG.database_url, connect_timeout=10)
     conn.autocommit = False
     try:
@@ -109,7 +101,6 @@ _SAFE_JOB_ID = re.compile(r"^\w[\w.\-]{0,63}$")
 
 
 def safe_job_id(job_id: str) -> str:
-    """Raise ValueError if job_id looks unsafe (prevents path traversal etc.)."""
     if not _SAFE_JOB_ID.match(job_id):
         raise ValueError(f"Invalid job_id: {job_id!r}")
     return job_id
@@ -127,10 +118,19 @@ def send_telegram(tid: int, message: str) -> None:
         log.warning("Failed to notify %s: %s", tid, exc)
 
 
+def _verify_token(token: str) -> int:
+    """Return telegram_id for token or raise 401."""
+    with db() as cur:
+        cur.execute("SELECT telegram_id FROM users WHERE token = %s", (token,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return row["telegram_id"]
+
+
 # ── Bot commands ──────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    username = user.username or "N/A"
     with db() as cur:
         cur.execute(
             """
@@ -138,10 +138,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             VALUES (%s, %s)
             ON CONFLICT (telegram_id) DO UPDATE SET username = EXCLUDED.username
             """,
-            (user.id, username),
+            (user.id, user.username or "N/A"),
         )
     await update.message.reply_text(
-        "👋 Welcome to Slurm Notifier Bot\n\nUse /help to see available commands."
+        "👋 Welcome to QueueWatch!\n\n"
+        "Get Telegram notifications for your Slurm jobs.\n\n"
+        "→ Use /link to get your API token\n"
+        "→ Use /help to see all commands"
     )
 
 
@@ -153,8 +156,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/track <job\\_id> — Track a job\n"
         "/myjobs — List tracked jobs\n"
         "/stop <job\\_id> — Stop tracking\n"
-        "/status <job\\_id> — Live Slurm status\n"
-        "/logs <job\\_id> — Last 20 lines of log\n",
+        "/logs <job\\_id> — Last 20 lines of log\n\n"
+        "📡 *API Usage*\n\n"
+        "`register\\_job?job\\_id=X&token=Y`\n"
+        "`notify?job\\_id=X&message=M&token=Y`",
         parse_mode="Markdown",
     )
 
@@ -176,7 +181,10 @@ async def link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             (user.id, user.username or "N/A", token),
         )
     await update.message.reply_text(
-        f"🔑 Your API token (keep it secret):\n`{token}`", parse_mode="Markdown"
+        "🔑 *Your API token* (keep it secret):\n\n"
+        f"`{token}`\n\n"
+        "Use this in your Slurm scripts as `token=...`",
+        parse_mode="Markdown",
     )
 
 
@@ -235,47 +243,6 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"🛑 Stopped tracking `{job_id}`", parse_mode="Markdown")
 
 
-def _slurm_status(job_id: str) -> str:
-    """Try squeue then sacct; return formatted text or raise RuntimeError."""
-    try:
-        out = subprocess.check_output(
-            ["squeue", "-j", job_id, "-o", "%.18i %.9P %.8j %.8u %.2t %.10M %.6D %R"],
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        ).decode()
-        if job_id in out:
-            return out.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    try:
-        out = subprocess.check_output(
-            ["sacct", "-j", job_id, "--format=JobID,State,Elapsed", "--noheader"],
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        ).decode().strip()
-        if out:
-            return out
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    raise RuntimeError("Job not found or already finished.")
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /status <job_id>")
-        return
-    try:
-        job_id = safe_job_id(context.args[0])
-        text = _slurm_status(job_id)
-        await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
-    except ValueError:
-        await update.message.reply_text("❌ Invalid job ID.")
-    except RuntimeError as exc:
-        await update.message.reply_text(str(exc))
-
-
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Usage: /logs <job_id>")
@@ -287,8 +254,6 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     log_file = Path(CFG.log_dir) / f"slurm-{job_id}.out"
-
-    # Guard against path traversal even after safe_job_id
     try:
         log_file = log_file.resolve()
         log_file.relative_to(Path(CFG.log_dir).resolve())
@@ -315,22 +280,12 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
-api = FastAPI(title="Slurm Notifier API")
-
-
-def _verify_token(token: str) -> int:
-    """Return telegram_id for token or raise 401."""
-    with db() as cur:
-        cur.execute("SELECT telegram_id FROM users WHERE token = %s", (token,))
-        row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return row["telegram_id"]
+api = FastAPI(title="QueueWatch API")
 
 
 @api.post("/register_job")
 async def register_job(job_id: str, token: str) -> dict:
-    """Register a job to be tracked for the user owning *token*."""
+    """Register a job. token comes from /link in Telegram."""
     try:
         job_id = safe_job_id(job_id)
     except ValueError:
@@ -346,17 +301,9 @@ async def register_job(job_id: str, token: str) -> dict:
 
 
 @api.post("/notify")
-async def notify(
-    job_id: str,
-    message: str,
-    x_notify_secret: str = Header(default=""),
-) -> dict:
-    """
-    Broadcast *message* to every user tracking *job_id*.
-    Requires the X-Notify-Secret header matching NOTIFY_SECRET env var.
-    """
-    if not secrets.compare_digest(x_notify_secret, CFG.notify_secret):
-        raise HTTPException(status_code=403, detail="Forbidden")
+async def notify(job_id: str, message: str, token: str) -> dict:
+    """Send a notification. Only works for jobs belonging to this token's user."""
+    tid = _verify_token(token)
 
     try:
         job_id = safe_job_id(job_id)
@@ -364,18 +311,18 @@ async def notify(
         raise HTTPException(status_code=400, detail="Invalid job_id")
 
     with db() as cur:
-        cur.execute("SELECT telegram_id FROM jobs WHERE job_id = %s", (job_id,))
-        users = cur.fetchall()
-        cur.execute("UPDATE jobs SET status = %s WHERE job_id = %s", (message, job_id))
+        cur.execute(
+            "SELECT telegram_id FROM jobs WHERE job_id = %s AND telegram_id = %s",
+            (job_id, tid),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Job not found or not yours")
+
+        cur.execute("UPDATE jobs SET status = %s WHERE job_id = %s AND telegram_id = %s", (message, job_id, tid))
         cur.execute("INSERT INTO logs (job_id, message) VALUES (%s, %s)", (job_id, message))
 
-    if not users:
-        return {"status": "no_subscribers"}
-
-    for row in users:
-        send_telegram(row["telegram_id"], f"[{job_id}] {message}")
-
-    return {"status": "sent", "recipients": len(users)}
+    send_telegram(tid, f"[{job_id}] {message}")
+    return {"status": "sent"}
 
 
 @api.get("/health")
@@ -393,7 +340,6 @@ BOT_COMMANDS = [
     BotCommand("track",  "Track a job"),
     BotCommand("myjobs", "List tracked jobs"),
     BotCommand("stop",   "Stop tracking a job"),
-    BotCommand("status", "Live job status"),
     BotCommand("logs",   "Show last 20 log lines"),
 ]
 
@@ -405,7 +351,6 @@ async def post_init(app) -> None:
 def main() -> None:
     init_db()
 
-    # Run FastAPI in a daemon thread
     api_thread = threading.Thread(
         target=lambda: uvicorn.run(api, host=CFG.api_host, port=CFG.api_port),
         daemon=True,
@@ -429,7 +374,6 @@ def main() -> None:
         ("track",  track),
         ("myjobs", myjobs),
         ("stop",   stop),
-        ("status", status),
         ("logs",   logs),
     ]:
         bot.add_handler(CommandHandler(cmd, handler))
