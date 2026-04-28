@@ -49,7 +49,7 @@ def load_config() -> Config:
 
 
 CFG = load_config()
-
+log.info(f"DATABASE_URL: {CFG.database_url}")
 
 # ── Database ──────────────────────────────────────────────────────────────────
 SCHEMA = """
@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     job_id      TEXT,
     telegram_id BIGINT REFERENCES users(telegram_id) ON DELETE CASCADE,
     status      TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW(), -- Add this line
     UNIQUE(job_id, telegram_id)
 );
 
@@ -210,11 +211,13 @@ async def track(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def myjobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.effective_user.id
     with db() as cur:
+        # Sort by the actual creation time
         cur.execute(
-            "SELECT job_id, status FROM jobs WHERE telegram_id = %s ORDER BY ctid DESC",
+            "SELECT job_id, status FROM jobs WHERE telegram_id = %s ORDER BY created_at DESC",
             (tid,),
         )
         jobs = cur.fetchall()
+    # ... rest of the function
 
     if not jobs:
         await update.message.reply_text("No tracked jobs.")
