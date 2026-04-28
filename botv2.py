@@ -256,30 +256,24 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌ Invalid job ID.")
         return
 
-    log_file = Path(CFG.log_dir) / f"slurm-{job_id}.out"
-    try:
-        log_file = log_file.resolve()
-        log_file.relative_to(Path(CFG.log_dir).resolve())
-    except ValueError:
-        await update.message.reply_text("❌ Access denied.")
+    with db() as cur:
+        cur.execute("""
+            SELECT message, ts FROM logs
+            WHERE job_id = %s
+            ORDER BY ts DESC
+            LIMIT 1
+        """, (job_id,))
+        row = cur.fetchone()
+
+    if not row:
+        await update.message.reply_text("No logs found for this job.")
         return
 
-    if not log_file.exists():
-        await update.message.reply_text("Log file not found.")
-        return
-
-    try:
-        output = subprocess.check_output(
-            ["tail", "-n", "20", str(log_file)], timeout=5
-        ).decode()
-        await update.message.reply_text(
-            f"```\n{output or '(empty)'}\n```", parse_mode="Markdown"
-        )
-    except subprocess.TimeoutExpired:
-        await update.message.reply_text("⏱ Timed out reading log.")
-    except Exception as exc:
-        log.error("Error reading logs for %s: %s", job_id, exc)
-        await update.message.reply_text("Error reading log file.")
+    await update.message.reply_text(
+        f"📄 *Last log for `{job_id}`* ({row['ts'].strftime('%H:%M:%S')})\n\n"
+        f"```\n{row['message']}\n```",
+        parse_mode="Markdown",
+    )
 
 
 # ── FastAPI ───────────────────────────────────────────────────────────────────
@@ -326,6 +320,31 @@ async def notify(job_id: str, message: str, token: str) -> dict:
 
     send_telegram(tid, f"[{job_id}] {message}")
     return {"status": "sent"}
+
+@api.post("/push_logs")
+async def push_logs(job_id: str, token: str, lines: str) -> dict:
+    """Called from job script to store latest log lines."""
+    tid = _verify_token(token)
+
+    try:
+        job_id = safe_job_id(job_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+
+    with db() as cur:
+        cur.execute(
+            "SELECT telegram_id FROM jobs WHERE job_id = %s AND telegram_id = %s",
+            (job_id, tid),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Job not found or not yours")
+
+        # store as a single log entry, overwrite previous tail
+        cur.execute("""
+            INSERT INTO logs (job_id, message) VALUES (%s, %s)
+        """, (job_id, f"[tail]\n{lines}"))
+
+    return {"status": "ok"}
 
 
 @api.get("/health")
